@@ -29,7 +29,7 @@ long_message = "Split"
 #Limits the split count for long messages. When for example set to 1 the message will simply be trimmed to one message.
 long_message_split_limit = 2
 #Enables colors and text highlights for respones.
-color = false
+color = true
 #Limits the maximum command complexity to prevent endless loops.
 command_complexity = 64
 

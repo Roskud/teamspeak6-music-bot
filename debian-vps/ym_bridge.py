@@ -16,6 +16,48 @@ import glob
 logging.getLogger("yandex_music").setLevel(logging.CRITICAL)
 
 try:
+    import paramiko
+except ImportError:
+    paramiko = None
+
+class SSHSocket:
+    def __init__(self, host, port, user, password, timeout=6):
+        if not paramiko:
+            raise RuntimeError("paramiko is not installed")
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.connect(host, port=port, username=user, password=password, timeout=timeout, look_for_keys=False, allow_agent=False)
+        self.channel = self.client.invoke_shell()
+        self.channel.settimeout(timeout)
+
+    def sendall(self, data):
+        return self.channel.sendall(data)
+
+    def send(self, data):
+        return self.channel.send(data)
+
+    def recv(self, n):
+        return self.channel.recv(n)
+
+    def settimeout(self, t):
+        self.channel.settimeout(t)
+
+    def close(self):
+        try:
+            self.channel.close()
+            self.client.close()
+        except Exception:
+            pass
+
+def create_ts_connection(host, port, user, password, timeout=6):
+    if port == 10022 or (paramiko and port != 10011):
+        try:
+            return SSHSocket(host, port, user, password, timeout=timeout)
+        except Exception as e:
+            print(f"[TS3] SSH query connection warning: {e}, falling back...")
+    return socket.create_connection((host, port), timeout=timeout)
+
+try:
     import yandex_music
 except ImportError:
     yandex_music = None
@@ -304,7 +346,7 @@ class TS3QueryClient:
                     self.sock.close()
                 except Exception:
                     pass
-            self.sock = socket.create_connection((self.host, self.port), timeout=6)
+            self.sock = create_ts_connection(self.host, self.port, self.user, self.password, timeout=6)
             self.sock.recv(1024) # TS3 greeting
 
             auth = f"login {self.user} {self.password}\n" if self.password else f"login {self.user}\n"
@@ -390,7 +432,7 @@ class ChanListener:
 
     def start(self):
         try:
-            s = socket.create_connection((self.host, self.port), timeout=5)
+            s = create_ts_connection(self.host, self.port, self.user, self.password, timeout=5)
             self.sock = s
             s.recv(1024)
             auth = f"login {self.user} {self.password}\n" if self.password else f"login {self.user}\n"
@@ -605,11 +647,14 @@ class TS3Bridge:
                         if bot.cid != cid:
                             old_cid = bot.cid
                             bot.cid = cid
+                            bot.empty_since = None
                             print(f"[MOVE] Bot {bot.name} (ID {bid}) moved: Channel #{old_cid} -> Channel #{cid}")
 
-                        # Ensure bot cannot send channel text chat (prevent error spam)
+                        # Ensure bot cannot send channel, server, or private text chat (prevent error spam)
                         if getattr(bot, '_silenced_cldbid', None) != cldbid:
                             self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
+                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
+                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=i_client_private_textmessage_power permvalue=-1 permnegated=1 permskip=1")
                             bot._silenced_cldbid = cldbid
 
             # Check for missing temporary bots (kicked from server / disconnected)
@@ -643,18 +688,12 @@ class TS3Bridge:
         for bid in bots_to_cleanup:
             self.cleanup_bot(bid)
 
-        # Synchronize channel listeners for active channels
+        # Synchronize channel listeners for active channels housing temporary bots
         with self.lock:
             active_cids = set()
             for bot in self.bots.values():
                 if not bot.is_main and bot.cid and bot.cid != 1:
                     active_cids.add(bot.cid)
-            for clid, info in clients.items():
-                cid = info.get("cid", 1)
-                ctype = info.get("type", 0)
-                nick = info.get("nick", "")
-                if ctype == 0 and cid != 1 and not any(k in nick for k in ["YandexBridge", "YB_", "serveradmin", "MusicBot", "VibeSpeak"]):
-                    active_cids.add(cid)
 
             cids_to_add = [cid for cid in active_cids if cid not in self.chan_listeners or not self.chan_listeners[cid].running]
             cids_to_remove = [cid for cid in self.chan_listeners.keys() if cid not in active_cids]
@@ -747,10 +786,10 @@ class TS3Bridge:
                     time.sleep(0.2)
                     continue
 
-                m = re.search(r'User\s+([^\r\n]+?)\s+requested:\s*([!/].+)', line)
+                m = re.search(r'User\s+"?([^"\r\n]+?)"?\s+requested:\s*"?([!/][^"\r\n]+)"?', line)
                 if m:
-                    invoker = m.group(1).strip()
-                    cmd_text = m.group(2).strip()
+                    invoker = m.group(1).strip().strip('"\'')
+                    cmd_text = m.group(2).strip().strip('"\'')
 
                     now = time.time()
                     dedup_key = f"{invoker}:{cmd_text}"
@@ -758,7 +797,6 @@ class TS3Bridge:
                         last_t = self.processed_cmds.get(dedup_key, 0)
                         if now - last_t < 1.5:
                             continue  # already handled in channel listener!
-                        self.processed_cmds[dedup_key] = now
 
                     print(f"[PM/LOG] Intercepted user '{invoker}': {cmd_text}")
                     clients = self.query_clients()
@@ -786,7 +824,7 @@ class TS3Bridge:
             except Exception:
                 pass
 
-        s = socket.create_connection((self.host, self.port), timeout=6)
+        s = create_ts_connection(self.host, self.port, self.user, self.password, timeout=6)
         self.event_sock = s
         s.recv(1024)
 
@@ -1178,6 +1216,8 @@ class TS3Bridge:
         self.cmd_client.execute(f"clientmove clid={new_clid} cid={user_cid}")
         if new_cldbid:
             self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
+            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
+            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=i_client_private_textmessage_power permvalue=-1 permnegated=1 permskip=1")
 
         new_bot = BotInstance(bot_id=new_id, name=bot_name, is_main=False, cid=user_cid)
         new_bot.clid = new_clid
@@ -1645,6 +1685,7 @@ class TS3Bridge:
                                         else:
                                             print(f"[EVENT] Temporary bot {bot.name} moved to channel #{target_cid}.")
                                             bot.cid = target_cid
+                                            bot.empty_since = None
                                         break
                         self.sync_channels_and_bots()
                         continue
