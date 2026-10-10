@@ -10,7 +10,7 @@ bot_group_id = 0
 #Tries to fetch a cover image when playing.
 generate_status_avatar = false
 #Sets the description of the bot to the current song title.
-set_status_description = true
+set_status_description = false
 #The language the bot should use to respond to users. (Make sure you have added the required language packs)
 language = "en"
 #Starts the instance when the TS3AudioBot is launched.

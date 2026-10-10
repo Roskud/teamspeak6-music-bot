@@ -473,6 +473,7 @@ class ChanListener:
 
     def _loop(self):
         buf = ""
+        last_ping = time.time()
         while self.running:
             try:
                 chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
@@ -482,9 +483,16 @@ class ChanListener:
                 while '\n' in buf:
                     line, buf = buf.split('\n', 1)
                     line = line.strip()
-                    if line.startswith('notifytextmessage'):
+                    if 'notifytextmessage' in line:
+                        line = line[line.find('notifytextmessage'):]
                         self.on_msg(self.cid, line)
             except (socket.timeout, TimeoutError):
+                if time.time() - last_ping > 45:
+                    try:
+                        self.sock.sendall(b"whoami\n")
+                        last_ping = time.time()
+                    except Exception:
+                        break
                 continue
             except Exception:
                 break
@@ -688,12 +696,22 @@ class TS3Bridge:
         for bid in bots_to_cleanup:
             self.cleanup_bot(bid)
 
-        # Synchronize channel listeners for active channels housing temporary bots
+        # Synchronize channel listeners for active channels housing temporary bots or users
         with self.lock:
             active_cids = set()
             for bot in self.bots.values():
                 if not bot.is_main and bot.cid and bot.cid != 1:
                     active_cids.add(bot.cid)
+
+            # Channels where human users are present (so !play and !bot add work in any channel chat!)
+            bot_clids = {b.clid for b in self.bots.values() if b.clid}
+            for clid, info in clients.items():
+                cid = info.get("cid", 1)
+                ctype = info.get("type", 0)
+                nick = info.get("nick", "")
+                if ctype == 0 and cid != 1 and clid not in bot_clids:
+                    if not any(k in nick for k in ["YandexBridge", "YB_", "serveradmin", "MusicBot", "VibeSpeak"]):
+                        active_cids.add(cid)
 
             cids_to_add = [cid for cid in active_cids if cid not in self.chan_listeners or not self.chan_listeners[cid].running]
             cids_to_remove = [cid for cid in self.chan_listeners.keys() if cid not in active_cids]
@@ -734,7 +752,7 @@ class TS3Bridge:
         msg = ts3_unescape(msg_raw)
         invoker = ts3_unescape(invoker_raw)
 
-        if any(k in invoker for k in ['VibeSpeak', 'MusicBot', 'YandexBridge', 'YB_', 'serveradmin']):
+        if any(k in invoker for k in ['VibeSpeak', 'MusicBot', 'YandexBridge', 'YB_']):
             return
 
         invoker_clid = int(invoker_clid_str) if invoker_clid_str.isdigit() else 0
@@ -997,12 +1015,26 @@ class TS3Bridge:
             except Exception as e:
                 return None, f"Ошибка загрузки альбома: {e}"
 
-        # Check for Playlist link: music.yandex.ru/users/.../playlists/...
+        # Check for Playlist link: music.yandex.ru/users/.../playlists/... or music.yandex.ru/playlists/...
         pl_match = re.search(r'users/([^/]+)/playlists/(\d+)', query)
         if pl_match:
             try:
                 user_id, kind = pl_match.group(1), int(pl_match.group(2))
                 pl = self.ym_client.users_playlists(kind, user_id)
+                if pl and pl.tracks:
+                    raw_tracks = [t.track for t in pl.tracks if getattr(t, 'track', None)]
+                    if raw_tracks:
+                        items = [self._make_track_item(t) for t in raw_tracks]
+                        pl_title = pl.title or "Плейлист"
+                        return items, f"плейлист \"{pl_title}\""
+            except Exception as e:
+                return None, f"Ошибка загрузки плейлиста: {e}"
+
+        pl_uuid_match = re.search(r'playlists/([a-zA-Z0-9_\-\.]+)', query)
+        if pl_uuid_match:
+            try:
+                pl_uuid = pl_uuid_match.group(1)
+                pl = self.ym_client.playlist(pl_uuid)
                 if pl and pl.tracks:
                     raw_tracks = [t.track for t in pl.tracks if getattr(t, 'track', None)]
                     if raw_tracks:
@@ -1152,7 +1184,7 @@ class TS3Bridge:
                     self.send_channel_msg(msg, cid=user_cid)
                     if invoker_clid:
                         self.send_pm_msg(invoker_clid, msg)
-                    return
+                    return bot
 
             temp_bots = [b for b in self.bots.values() if not b.is_main]
             if len(temp_bots) >= MAX_TEMP_BOTS:
@@ -1160,7 +1192,7 @@ class TS3Bridge:
                 self.send_channel_msg(msg, cid=user_cid)
                 if invoker_clid:
                     self.send_pm_msg(invoker_clid, msg)
-                return
+                return None
 
             existing_nums = set()
             for b in self.bots.values():
@@ -1183,7 +1215,7 @@ class TS3Bridge:
             self.send_channel_msg(err, cid=user_cid)
             if invoker_clid:
                 self.send_pm_msg(invoker_clid, err)
-            return
+            return None
 
         time.sleep(0.8)
         name_enc = urllib.parse.quote(bot_name, safe='')
@@ -1211,7 +1243,7 @@ class TS3Bridge:
             if invoker_clid:
                 self.send_pm_msg(invoker_clid, err)
             self.cleanup_bot(new_id)
-            return
+            return None
 
         self.cmd_client.execute(f"clientmove clid={new_clid} cid={user_cid}")
         if new_cldbid:
@@ -1235,6 +1267,7 @@ class TS3Bridge:
         )
         if invoker_clid:
             self.send_pm_msg(invoker_clid, f"🤖 Временный бот {bot_name} прибыл в ваш канал!")
+        return new_bot
 
     def handle_bot_remove(self, user_cid, invoker_clid=None):
         target_bot = None
@@ -1347,11 +1380,14 @@ class TS3Bridge:
 
         print(f"[CMD] {invoker} (Chan #{invoker_cid}, src={source}): !{cmd} '{arg}'")
 
+        def reply(msg):
+            self.send_channel_msg(msg, cid=invoker_cid)
+            if source == "pm" and invoker_clid:
+                self.send_pm_msg(invoker_clid, msg)
+
         # 1. HELP / COMMANDS
         if cmd in ["help", "commands", "cmd", "команды", "помощь"]:
-            self.send_channel_msg(COMMANDS_HELP_TEXT, cid=invoker_cid)
-            if source == "pm" and invoker_clid:
-                self.send_pm_msg(invoker_clid, COMMANDS_HELP_TEXT)
+            reply(COMMANDS_HELP_TEXT)
             return
 
         # 2. MULTI-BOT MANAGEMENT COMMANDS (!bot add, !bot remove, !bot list)
@@ -1372,9 +1408,7 @@ class TS3Bridge:
                 "• !bot remove — убрать временного бота из вашего канала\n"
                 "• !bot list — показать всех активных ботов"
             )
-            self.send_channel_msg(bot_help, cid=invoker_cid)
-            if source == "pm" and invoker_clid:
-                self.send_pm_msg(invoker_clid, bot_help)
+            reply(bot_help)
             return
 
         if cmd in ["боты", "bots"]:
@@ -1392,29 +1426,20 @@ class TS3Bridge:
         if not target_bot:
             # If user wants to play music or radio, auto-summon a bot to their channel!
             if cmd in ["play", "p", "плей", "играй", "radio", "r", "радио", "lofi"]:
-                self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid)
-                time.sleep(0.5)
-                with self.lock:
-                    for bot in self.bots.values():
-                        if bot.cid == invoker_cid:
-                            target_bot = bot
-                            break
+                target_bot = self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid)
 
             if not target_bot:
                 msg_not_found = (
                     "ℹ️ В вашем канале сейчас нет музыкального бота.\n"
                     "Напишите: !bot add, чтобы позвать временного бота в ваш канал!"
                 )
-                self.send_channel_msg(msg_not_found, cid=invoker_cid)
-                if source == "pm" and invoker_clid:
-                    self.send_pm_msg(invoker_clid, msg_not_found)
+                reply(msg_not_found)
                 return
-
 
         # 3. RADIO COMMANDS
         if cmd in ["radio", "r", "радио"]:
             if not arg:
-                self.send_channel_msg(RADIO_HELP_TEXT, cid=invoker_cid)
+                reply(RADIO_HELP_TEXT)
                 return
             choice = arg.strip()
             if choice in RADIO_STATIONS:
@@ -1428,9 +1453,10 @@ class TS3Bridge:
                 with self.lock:
                     target_bot.queue.clear()
                     target_bot.is_looping = False
-                self.play_item(target_bot, item, notify=True)
+                self.play_item(target_bot, item, notify=False)
+                reply(f"📻 Включено радио #{choice}: {r_name}")
             else:
-                self.send_channel_msg("Неверный номер станции. Напишите: !radio (доступны станции от 1 до 11)", cid=invoker_cid)
+                reply("Неверный номер станции. Напишите: !radio (доступны станции от 1 до 11)")
             return
 
         if cmd in ["lofi", "lo-fi", "лофи"]:
@@ -1444,42 +1470,44 @@ class TS3Bridge:
             with self.lock:
                 target_bot.queue.clear()
                 target_bot.is_looping = False
-            self.play_item(target_bot, item, notify=True)
+            self.play_item(target_bot, item, notify=False)
+            reply(f"📻 Включено радио #1: {r_name} (24/7)")
             return
 
         # 4. PLAY COMMAND (YANDEX MUSIC)
         if cmd in ["play", "p", "плей"]:
             if not arg:
-                self.send_channel_msg("Используйте: !play <название или ссылка> (например: !play Король и Шут Лесник)", cid=invoker_cid)
+                reply("Используйте: !play <название или ссылка> (например: !play Король и Шут Лесник)")
                 return
 
             print(f"[YM] Searching: {arg!r}...")
             items, err = self.resolve_yandex(arg)
             print(f"[YM] Found: {len(items) if items else 0} items. Error: {err}")
             if not items:
-                self.send_channel_msg(f"❌ {err or 'Трек не найден'}", cid=invoker_cid)
+                reply(f"❌ {err or 'Трек не найден'}")
                 return
 
             with self.lock:
                 if target_bot.current_item is not None:
                     target_bot.queue.extend(items)
                     if len(items) == 1:
-                        self.send_channel_msg(f"➕ Добавлено в очередь (#{len(target_bot.queue)}): {items[0]['title']}", cid=invoker_cid)
+                        reply(f"➕ Добавлено в очередь (#{len(target_bot.queue)}): {items[0]['title']}")
                     else:
-                        self.send_channel_msg(f"➕ Добавлено в очередь: {len(items)} трек(ов) ({err or 'альбом/плейлист'}).", cid=invoker_cid)
+                        reply(f"➕ Добавлено в очередь: {len(items)} трек(ов) ({err or 'альбом/плейлист'}).")
                 else:
                     first_item = items[0]
                     if len(items) > 1:
                         target_bot.queue.extend(items[1:])
-                        self.send_channel_msg(f"➕ В очереди {len(items)-1} трек(ов) ({err or 'альбом/плейлист'}).", cid=invoker_cid)
-                    self.play_item(target_bot, first_item, notify=True)
+                        reply(f"➕ В очереди {len(items)-1} трек(ов) ({err or 'альбом/плейлист'}).")
+                    self.play_item(target_bot, first_item, notify=False)
+                    reply(f"▶ Играет Яндекс.Музыка: {first_item['title']}")
             return
 
         # 5. QUEUE COMMAND (!queue, !q, !очередь)
         if cmd in ["queue", "q", "очередь"]:
             with self.lock:
                 if not target_bot.current_item and not target_bot.queue:
-                    self.send_channel_msg("Очередь воспроизведения пуста. Добавьте трек: !play <название>", cid=invoker_cid)
+                    reply("Очередь воспроизведения пуста. Добавьте трек: !play <название>")
                     return
 
                 msg = f"🎵 ОЧЕРЕДЬ ВОСПРОИЗВЕДЕНИЯ ({1 + len(target_bot.queue)} трек(ов)):\n"
@@ -1508,7 +1536,7 @@ class TS3Bridge:
                     msg += "\n📋 Больше треков в очереди нет.\n"
 
                 msg += "\nУправление: !skip (пропуск) | !loop (повтор) | !clear (очистить)"
-            self.send_channel_msg(msg.strip(), cid=invoker_cid)
+            reply(msg.strip())
             return
 
         # 6. LOOP COMMAND (!loop, !repeat, !повтор)
@@ -1516,9 +1544,9 @@ class TS3Bridge:
             with self.lock:
                 target_bot.is_looping = not target_bot.is_looping
                 if target_bot.is_looping:
-                    self.send_channel_msg("🔁 Зацикливание включено: текущий трек будет повторяться.", cid=invoker_cid)
+                    reply("🔁 Зацикливание включено: текущий трек будет повторяться.")
                 else:
-                    self.send_channel_msg("➡️ Зацикливание выключено: треки будут играть по очереди.", cid=invoker_cid)
+                    reply("➡️ Зацикливание выключено: треки будут играть по очереди.")
             return
 
         # 7. SKIP / NEXT COMMAND (!skip, !next, !скип)
@@ -1527,10 +1555,10 @@ class TS3Bridge:
                 target_bot.is_looping = False
                 if target_bot.queue:
                     next_item = target_bot.queue.pop(0)
-                    self.send_channel_msg("⏭️ Трек пропущен.", cid=invoker_cid)
-                    self.play_item(target_bot, next_item, notify=True)
+                    reply(f"⏭️ Пропуск трека. Следующий: {next_item['title']}")
+                    self.play_item(target_bot, next_item, notify=False)
                 else:
-                    self.send_channel_msg("⏭️ Очередь пуста. Воспроизведение остановлено.", cid=invoker_cid)
+                    reply("⏭️ Очередь пуста. Воспроизведение остановлено.")
                     self.command_bot_silent("!stop", bot_id=target_bot.bot_id)
                     target_bot.current_item = None
                     self.clear_bot_avatar(target_bot.bot_id)
@@ -1539,22 +1567,22 @@ class TS3Bridge:
         # 8. REMOVE TRACK FROM QUEUE (!remove <number>)
         if cmd in ["remove", "rem", "del", "delete", "удалить"]:
             if not arg or not arg.strip().isdigit():
-                self.send_channel_msg("Укажите номер трека в очереди: !remove <номер> (например: !remove 2)", cid=invoker_cid)
+                reply("Укажите номер трека в очереди: !remove <номер> (например: !remove 2)")
                 return
             num = int(arg.strip())
             with self.lock:
                 if 1 <= num <= len(target_bot.queue):
                     removed = target_bot.queue.pop(num - 1)
-                    self.send_channel_msg(f"🗑️ Удален из очереди (#{num}): {removed['title']}", cid=invoker_cid)
+                    reply(f"🗑️ Удален из очереди (#{num}): {removed['title']}")
                 else:
-                    self.send_channel_msg(f"Трек #{num} не найден в очереди. Проверьте список: !queue", cid=invoker_cid)
+                    reply(f"Трек #{num} не найден в очереди. Проверьте список: !queue")
             return
 
         # 9. CLEAR QUEUE (!clear)
         if cmd in ["clear", "очистить"]:
             with self.lock:
                 target_bot.queue.clear()
-                self.send_channel_msg("🗑️ Очередь треков очищена (текущий трек продолжит играть).", cid=invoker_cid)
+                reply("🗑️ Очередь треков очищена (текущий трек продолжит играть).")
             return
 
         # 10. STOP COMMAND
@@ -1566,7 +1594,7 @@ class TS3Bridge:
                 target_bot.is_radio = False
                 self.command_bot_silent("!stop", bot_id=target_bot.bot_id)
                 self.clear_bot_avatar(target_bot.bot_id)
-                self.send_channel_msg("⏹️ Воспроизведение остановлено, очередь очищена.", cid=invoker_cid)
+                reply("⏹️ Воспроизведение остановлено, очередь очищена.")
             return
 
         # 11. PAUSE / RESUME
@@ -1576,11 +1604,11 @@ class TS3Bridge:
                 with urllib.request.urlopen(f"http://127.0.0.1:58913/api/bot/use/{target_bot.bot_id}/(/song)", timeout=1) as r:
                     data = json.loads(r.read().decode())
                     if data.get("Paused", False):
-                        self.send_channel_msg("⏸️ Пауза (воспроизведение приостановлено).", cid=invoker_cid)
+                        reply("⏸️ Пауза (воспроизведение приостановлено).")
                     else:
-                        self.send_channel_msg("▶️ Воспроизведение возобновлено.", cid=invoker_cid)
+                        reply("▶️ Воспроизведение возобновлено.")
             except Exception:
-                self.send_channel_msg("⏸️ Пауза / продолжение воспроизведения.", cid=invoker_cid)
+                reply("⏸️ Пауза / продолжение воспроизведения.")
             return
 
         # 12. VOLUME / VOL
@@ -1590,17 +1618,17 @@ class TS3Bridge:
                     vol_val = int(re.sub(r'[^0-9]', '', arg))
                     vol_val = max(0, min(100, vol_val))
                     self.command_bot_silent(f"!volume {vol_val}", bot_id=target_bot.bot_id)
-                    self.send_channel_msg(f"🔊 Громкость установлена на {vol_val}%.", cid=invoker_cid)
+                    reply(f"🔊 Громкость установлена на {vol_val}%.")
                 except Exception:
-                    self.send_channel_msg("Используйте: !vol <0..100> (например: !vol 50)", cid=invoker_cid)
+                    reply("Используйте: !vol <0..100> (например: !vol 50)")
             else:
                 try:
                     with urllib.request.urlopen(f"http://127.0.0.1:58913/api/bot/use/{target_bot.bot_id}/(/volume)", timeout=1) as r:
                         data = json.loads(r.read().decode())
                         curr = int(data.get("Value", 50))
-                        self.send_channel_msg(f"🔊 Текущая громкость: {curr}%. (Для изменения: !vol <0..100>)", cid=invoker_cid)
+                        reply(f"🔊 Текущая громкость: {curr}%. (Для изменения: !vol <0..100>)")
                 except Exception:
-                    self.send_channel_msg("🔊 Громкость регулируется командой: !vol <0..100>", cid=invoker_cid)
+                    reply("🔊 Громкость регулируется командой: !vol <0..100>")
             return
 
         # 13. SONG / NP
@@ -1624,9 +1652,9 @@ class TS3Bridge:
 
                     loop_str = " • 🔁 Повтор: ВКЛ" if target_bot.is_looping else ""
                     q_count = f" • В очереди: {len(target_bot.queue)}" if target_bot.queue else ""
-                    self.send_channel_msg(f"🎵 Сейчас играет: {target_bot.current_item['title']}{time_str}{paused_str}{loop_str}{q_count}", cid=invoker_cid)
+                    reply(f"🎵 Сейчас играет: {target_bot.current_item['title']}{time_str}{paused_str}{loop_str}{q_count}")
                 else:
-                    self.send_channel_msg("Сейчас ничего не играет. Включите трек: !play <название> или !radio 1..11", cid=invoker_cid)
+                    reply("Сейчас ничего не играет. Включите трек: !play <название> или !radio 1..11")
             return
 
     def run(self):
@@ -1654,11 +1682,11 @@ class TS3Bridge:
                 buf += chunk
                 while '\n' in buf:
                     line, buf = buf.split('\n', 1)
-                    line = line.strip()
-                    if not line or line.startswith("error id=") or "version=" in line:
+                    if not line or "version=" in line:
                         continue
 
-                    if line.startswith('notifyclientleftview'):
+                    if 'notifyclientleftview' in line:
+                        line = line[line.find('notifyclientleftview'):]
                         parts = line.split(' ')
                         left_clid = next((int(p[5:]) for p in parts if p.startswith('clid=') and p[5:].isdigit()), None)
                         if left_clid:
@@ -1671,7 +1699,8 @@ class TS3Bridge:
                         self.sync_channels_and_bots()
                         continue
 
-                    if line.startswith('notifyclientmoved'):
+                    if 'notifyclientmoved' in line:
+                        line = line[line.find('notifyclientmoved'):]
                         parts = line.split(' ')
                         moved_clid = next((int(p[5:]) for p in parts if p.startswith('clid=') and p[5:].isdigit()), None)
                         target_cid = next((int(p[5:]) for p in parts if p.startswith('ctid=') and p[5:].isdigit()), None)
@@ -1690,12 +1719,14 @@ class TS3Bridge:
                         self.sync_channels_and_bots()
                         continue
 
-                    if line.startswith('notifycliententerview'):
+                    if 'notifycliententerview' in line:
                         self.sync_channels_and_bots()
                         continue
 
-                    if not line.startswith('notifytextmessage'):
+                    if 'notifytextmessage' not in line:
                         continue
+
+                    line = line[line.find('notifytextmessage'):]
 
                     parts = line.split(' ')
                     targetmode = next((int(p[11:]) for p in parts if p.startswith('targetmode=') and p[11:].isdigit()), 2)
@@ -1705,7 +1736,7 @@ class TS3Bridge:
                     msg = ts3_unescape(msg_raw)
                     invoker = ts3_unescape(invoker_raw)
 
-                    if any(k in invoker for k in ['VibeSpeak', 'MusicBot', 'YandexBridge', 'YB_', 'serveradmin']):
+                    if any(k in invoker for k in ['VibeSpeak', 'MusicBot', 'YandexBridge', 'YB_']):
                         continue
 
                     invoker_clid = int(invoker_clid_str) if invoker_clid_str.isdigit() else 0
