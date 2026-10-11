@@ -286,7 +286,7 @@ COMMANDS_HELP_TEXT = (
     "🎵 КОМАНДЫ VIBESPEAK:\n\n"
     "▶ ВОСПРОИЗВЕДЕНИЕ (Яндекс.Музыка):\n"
     "• !play <название или артист> — воспроизвести трек (если уже играет — добавить в очередь)\n"
-    "• !play <ссылка на трек/альбом> — воспроизведение по прямой ссылке\n\n"
+    "• !play <ссылка на трек/альбом/плейлист> — воспроизведение по прямой ссылке\n\n"
     "📋 ОЧЕРЕДЬ И ЗАЦИКЛИВАНИЕ:\n"
     "• !queue (или !q) — показать текущую очередь и статус повтора\n"
     "• !loop (или !repeat) — включить / выключить зацикливание текущего трека\n"
@@ -662,7 +662,7 @@ class TS3Bridge:
                         if getattr(bot, '_silenced_cldbid', None) != cldbid:
                             self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
                             self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
-                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=i_client_private_textmessage_power permvalue=-1 permnegated=1 permskip=1")
+                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=i_client_private_textmessage_power permvalue=0 permnegated=1 permskip=1")
                             bot._silenced_cldbid = cldbid
 
             # Check for missing temporary bots (kicked from server / disconnected)
@@ -871,6 +871,11 @@ class TS3Bridge:
 
         s.settimeout(1.0)
         print("[TS3] Connected and listening to channel events.")
+        try:
+            self.cmd_client.execute("servergroupaddperm sgid=8 permsid=i_client_needed_private_textmessage_power permvalue=25 permnegated=0 permskip=0")
+            self.cmd_client.execute("servergroupaddperm sgid=8 permsid=i_client_private_textmessage_power permvalue=25 permnegated=0 permskip=0")
+        except Exception:
+            pass
         self.sync_channels_and_bots()
 
     def send_channel_msg(self, msg_text, cid=None):
@@ -1000,34 +1005,93 @@ class TS3Bridge:
         if not self.ym_client:
             return None, "Не удалось подключиться к сервису Яндекс.Музыка."
 
-        # Check for Album link: music.yandex.ru/album/12345
-        album_match = re.search(r'album/(\d+)(?!/track)', query)
-        if album_match:
-            try:
-                album_id = album_match.group(1)
-                album = self.ym_client.albums_with_tracks(album_id)
-                if album and album.volumes:
-                    raw_tracks = [t for v in album.volumes for t in v]
-                    if raw_tracks:
-                        items = [self._make_track_item(t) for t in raw_tracks]
-                        album_title = album.title or "Альбом"
-                        return items, f"альбом \"{album_title}\""
-            except Exception as e:
-                return None, f"Ошибка загрузки альбома: {e}"
+        # 1. Clean query of prefixes, quotes and leading symbols
+        clean_q = re.sub(r'^([!/]?\s*(?:ym:|play\s+|p\s+)|#\s*|№\s*)', '', query.strip(), flags=re.I).strip(" \"'#")
 
-        # Check for Playlist link: music.yandex.ru/users/.../playlists/... or music.yandex.ru/playlists/...
-        pl_match = re.search(r'users/([^/]+)/playlists/(\d+)', query)
-        if pl_match:
+        # 2. Check for Track link FIRST (before album or playlist!)
+        # Examples:
+        # https://music.yandex.ru/album/38077942/track/142548197?utm_source=...
+        # https://music.yandex.ru/track/142548197
+        track_match = re.search(r'track/(\d+)', query)
+        if track_match:
             try:
-                user_id, kind = pl_match.group(1), int(pl_match.group(2))
+                track_id = track_match.group(1)
+                tracks = self.ym_client.tracks([track_id])
+                if tracks:
+                    return [self._make_track_item(tracks[0])], None
+            except Exception as e:
+                return None, f"Ошибка загрузки трека: {e}"
+
+        # 3. Check for Album link (ONLY if not a track link!)
+        # Example: music.yandex.ru/album/12345
+        if "track/" not in query:
+            album_match = re.search(r'album/(\d+)(?:[/?#\s]|$)', query)
+            if album_match:
+                try:
+                    album_id = album_match.group(1)
+                    album = self.ym_client.albums_with_tracks(album_id)
+                    if album and album.volumes:
+                        raw_tracks = [t for v in album.volumes for t in v]
+                        if raw_tracks:
+                            items = [self._make_track_item(t) for t in raw_tracks]
+                            album_title = album.title or "Альбом"
+                            return items, f"альбом \"{album_title}\""
+                except Exception as e:
+                    return None, f"Ошибка загрузки альбома: {e}"
+
+        # 4. Check for Playlist link:
+        # music.yandex.ru/users/<user>/playlists/<kind>
+        # music.yandex.ru/users/<user>/playlists/likes (or favorites)
+        # music.yandex.ru/users/<user>/favorites (or likes)
+        pl_match = re.search(r'users/([^/?#\s]+)/playlists/([^/?#\s]+)', query)
+        user_id = None
+        kind_str = None
+        if pl_match:
+            user_id, kind_str = pl_match.group(1), pl_match.group(2)
+        else:
+            fav_match = re.search(r'users/([^/?#\s]+)/(?:favorites|likes)', query)
+            if fav_match:
+                user_id = fav_match.group(1)
+                kind_str = "3"
+
+        if user_id and kind_str:
+            try:
+                kind = 3 if kind_str.lower() in ["likes", "favorites"] else int(kind_str)
                 pl = self.ym_client.users_playlists(kind, user_id)
                 if pl and pl.tracks:
-                    raw_tracks = [t.track for t in pl.tracks if getattr(t, 'track', None)]
+                    raw_tracks = []
+                    ids_to_fetch = []
+                    for t in pl.tracks:
+                        tr = getattr(t, 'track', None)
+                        if tr and getattr(tr, 'title', None):
+                            raw_tracks.append(tr)
+                        elif getattr(t, 'title', None):
+                            raw_tracks.append(t)
+                        elif getattr(t, 'id', None):
+                            ids_to_fetch.append(str(t.id))
+
+                    if ids_to_fetch:
+                        for i in range(0, min(len(ids_to_fetch), 500), 100):
+                            chunk = ids_to_fetch[i:i+100]
+                            try:
+                                fetched = self.ym_client.tracks(chunk)
+                                if fetched:
+                                    raw_tracks.extend(fetched)
+                            except Exception:
+                                pass
+
                     if raw_tracks:
                         items = [self._make_track_item(t) for t in raw_tracks]
                         pl_title = pl.title or "Плейлист"
                         return items, f"плейлист \"{pl_title}\""
+                    else:
+                        return None, "В плейлисте нет доступных треков или он является приватным."
+                else:
+                    return None, "Плейлист пуст или скрыт настройками приватности (сделайте плейлист публичным в Яндекс.Музыке)."
             except Exception as e:
+                err_text = str(e)
+                if "not-found" in err_text.lower():
+                    return None, "Плейлист не найден. Убедитесь, что плейлист открыт (публичный) в Яндекс.Музыке."
                 return None, f"Ошибка загрузки плейлиста: {e}"
 
         pl_uuid_match = re.search(r'playlists/([a-zA-Z0-9_\-\.]+)', query)
@@ -1036,7 +1100,27 @@ class TS3Bridge:
                 pl_uuid = pl_uuid_match.group(1)
                 pl = self.ym_client.playlist(pl_uuid)
                 if pl and pl.tracks:
-                    raw_tracks = [t.track for t in pl.tracks if getattr(t, 'track', None)]
+                    raw_tracks = []
+                    ids_to_fetch = []
+                    for t in pl.tracks:
+                        tr = getattr(t, 'track', None)
+                        if tr and getattr(tr, 'title', None):
+                            raw_tracks.append(tr)
+                        elif getattr(t, 'title', None):
+                            raw_tracks.append(t)
+                        elif getattr(t, 'id', None):
+                            ids_to_fetch.append(str(t.id))
+
+                    if ids_to_fetch:
+                        for i in range(0, min(len(ids_to_fetch), 500), 100):
+                            chunk = ids_to_fetch[i:i+100]
+                            try:
+                                fetched = self.ym_client.tracks(chunk)
+                                if fetched:
+                                    raw_tracks.extend(fetched)
+                            except Exception:
+                                pass
+
                     if raw_tracks:
                         items = [self._make_track_item(t) for t in raw_tracks]
                         pl_title = pl.title or "Плейлист"
@@ -1044,19 +1128,8 @@ class TS3Bridge:
             except Exception as e:
                 return None, f"Ошибка загрузки плейлиста: {e}"
 
-        # Check for Track link: music.yandex.ru/album/.../track/123 or track/123
-        track_match = re.search(r'track/(\d+)', query)
-        if track_match:
-            try:
-                tracks = self.ym_client.tracks([track_match.group(1)])
-                if tracks:
-                    return [self._make_track_item(tracks[0])], None
-            except Exception as e:
-                return None, f"Ошибка загрузки трека: {e}"
-
-        # General Search query
+        # 5. General Search query (if not URL)
         try:
-            clean_q = re.sub(r'^(ym:|play\s+|p\s+)', '', query, flags=re.I).strip()
             search = self.ym_client.search(clean_q)
             if search and search.best and search.best.type == 'artist':
                 try:
@@ -1070,7 +1143,7 @@ class TS3Bridge:
         except Exception as e:
             return None, f"Ошибка поиска трека: {e}"
 
-        return None, f"Трек не найден на Яндекс.Музыке: {query}"
+        return None, f"Трек не найден на Яндекс.Музыке: {clean_q}"
 
     def play_item(self, bot, item, notify=True, is_loop=False):
         bid = bot.bot_id
@@ -1176,22 +1249,22 @@ class TS3Bridge:
     def disconnect_bot(self, bot_id):
         self.cleanup_bot(bot_id)
 
-    def handle_bot_add(self, user_cid, invoker_name, invoker_clid=None):
+    def handle_bot_add(self, user_cid, invoker_name, invoker_clid=None, source="channel"):
+        def reply_msg(msg):
+            if source == "pm" and invoker_clid:
+                self.send_pm_msg(invoker_clid, msg)
+            else:
+                self.send_channel_msg(msg, cid=user_cid)
+
         with self.lock:
             for bot in self.bots.values():
                 if bot.cid == user_cid:
-                    msg = f"ℹ️ В вашем канале уже находится бот {bot.name}."
-                    self.send_channel_msg(msg, cid=user_cid)
-                    if invoker_clid:
-                        self.send_pm_msg(invoker_clid, msg)
+                    reply_msg(f"ℹ️ В вашем канале уже находится бот {bot.name}.")
                     return bot
 
             temp_bots = [b for b in self.bots.values() if not b.is_main]
             if len(temp_bots) >= MAX_TEMP_BOTS:
-                msg = f"⚠️ Достигнут лимит временных ботов (максимум {MAX_TEMP_BOTS}). Освободите один из каналов."
-                self.send_channel_msg(msg, cid=user_cid)
-                if invoker_clid:
-                    self.send_pm_msg(invoker_clid, msg)
+                reply_msg(f"⚠️ Достигнут лимит временных ботов (максимум {MAX_TEMP_BOTS}). Освободите один из каналов.")
                 return None
 
             existing_nums = set()
@@ -1212,9 +1285,7 @@ class TS3Bridge:
                 new_id = data.get("Id")
         except Exception as e:
             err = f"❌ Ошибка подключения нового бота: {e}"
-            self.send_channel_msg(err, cid=user_cid)
-            if invoker_clid:
-                self.send_pm_msg(invoker_clid, err)
+            reply_msg(err)
             return None
 
         time.sleep(0.8)
@@ -1239,9 +1310,7 @@ class TS3Bridge:
 
         if not new_clid:
             err = f"❌ Не удалось обнаружить подключение бота {bot_name} на сервере."
-            self.send_channel_msg(err, cid=user_cid)
-            if invoker_clid:
-                self.send_pm_msg(invoker_clid, err)
+            reply_msg(err)
             self.cleanup_bot(new_id)
             return None
 
@@ -1249,7 +1318,7 @@ class TS3Bridge:
         if new_cldbid:
             self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
             self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
-            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=i_client_private_textmessage_power permvalue=-1 permnegated=1 permskip=1")
+            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=i_client_private_textmessage_power permvalue=0 permnegated=1 permskip=1")
 
         new_bot = BotInstance(bot_id=new_id, name=bot_name, is_main=False, cid=user_cid)
         new_bot.clid = new_clid
@@ -1265,11 +1334,11 @@ class TS3Bridge:
             f"• Бот автоматически выйдет, когда в канале никого не останется.",
             cid=user_cid
         )
-        if invoker_clid:
+        if source == "pm" and invoker_clid:
             self.send_pm_msg(invoker_clid, f"🤖 Временный бот {bot_name} прибыл в ваш канал!")
         return new_bot
 
-    def handle_bot_remove(self, user_cid, invoker_clid=None):
+    def handle_bot_remove(self, user_cid, invoker_clid=None, source="channel"):
         target_bot = None
         with self.lock:
             for bot in self.bots.values():
@@ -1277,27 +1346,25 @@ class TS3Bridge:
                     target_bot = bot
                     break
 
-        if not target_bot:
-            msg = "В вашем канале нет музыкального бота."
-            self.send_channel_msg(msg, cid=user_cid)
-            if invoker_clid:
+        def reply_msg(msg):
+            if source == "pm" and invoker_clid:
                 self.send_pm_msg(invoker_clid, msg)
+            else:
+                self.send_channel_msg(msg, cid=user_cid)
+
+        if not target_bot:
+            reply_msg("В вашем канале нет музыкального бота.")
             return
 
         if target_bot.is_main:
-            msg = "⚠️ Основной бот VibeSpeak закреплен на сервере и не может быть удален."
-            self.send_channel_msg(msg, cid=user_cid)
-            if invoker_clid:
-                self.send_pm_msg(invoker_clid, msg)
+            reply_msg("⚠️ Основной бот VibeSpeak закреплен на сервере и не может быть удален.")
             return
 
         msg = f"👋 Временный бот {target_bot.name} покидает канал."
-        self.send_channel_msg(msg, cid=user_cid)
-        if invoker_clid:
-            self.send_pm_msg(invoker_clid, msg)
+        reply_msg(msg)
         self.disconnect_bot(target_bot.bot_id)
 
-    def handle_bot_list(self, user_cid, invoker_clid=None):
+    def handle_bot_list(self, user_cid, invoker_clid=None, source="channel"):
         with self.lock:
             msg = "🤖 АКТИВНЫЕ БОТЫ VIBESPEAK:\n"
             for bot in sorted(self.bots.values(), key=lambda b: b.bot_id):
@@ -1307,9 +1374,10 @@ class TS3Bridge:
                     status = f"играет: {bot.current_item['title']}"
                 msg += f"• [{bot.name}] ({tag}) — Канал #{bot.cid} ({status})\n"
             msg += "\nЧтобы добавить бота в ваш канал: !bot add"
-        self.send_channel_msg(msg.strip(), cid=user_cid)
-        if invoker_clid:
+        if source == "pm" and invoker_clid:
             self.send_pm_msg(invoker_clid, msg.strip())
+        else:
+            self.send_channel_msg(msg.strip(), cid=user_cid)
 
     def playback_and_lifecycle_loop(self):
         while True:
@@ -1381,9 +1449,10 @@ class TS3Bridge:
         print(f"[CMD] {invoker} (Chan #{invoker_cid}, src={source}): !{cmd} '{arg}'")
 
         def reply(msg):
-            self.send_channel_msg(msg, cid=invoker_cid)
             if source == "pm" and invoker_clid:
                 self.send_pm_msg(invoker_clid, msg)
+            else:
+                self.send_channel_msg(msg, cid=invoker_cid)
 
         # 1. HELP / COMMANDS
         if cmd in ["help", "commands", "cmd", "команды", "помощь"]:
@@ -1394,13 +1463,13 @@ class TS3Bridge:
         if cmd == "bot":
             sub = arg.lower().split(' ')[0] if arg else ""
             if sub in ["add", "new", "+", "добавь", "создать"]:
-                self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid)
+                self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid, source=source)
                 return
             if sub in ["remove", "kick", "del", "delete", "-", "убрать", "удалить"]:
-                self.handle_bot_remove(invoker_cid, invoker_clid=invoker_clid)
+                self.handle_bot_remove(invoker_cid, invoker_clid=invoker_clid, source=source)
                 return
             if sub in ["list", "список", "боты"]:
-                self.handle_bot_list(invoker_cid, invoker_clid=invoker_clid)
+                self.handle_bot_list(invoker_cid, invoker_clid=invoker_clid, source=source)
                 return
             bot_help = (
                 "🤖 Управление ботами VibeSpeak:\n"
@@ -1412,7 +1481,7 @@ class TS3Bridge:
             return
 
         if cmd in ["боты", "bots"]:
-            self.handle_bot_list(invoker_cid, invoker_clid=invoker_clid)
+            self.handle_bot_list(invoker_cid, invoker_clid=invoker_clid, source=source)
             return
 
         # Find the target bot in invoker's channel
@@ -1426,7 +1495,7 @@ class TS3Bridge:
         if not target_bot:
             # If user wants to play music or radio, auto-summon a bot to their channel!
             if cmd in ["play", "p", "плей", "играй", "radio", "r", "радио", "lofi"]:
-                target_bot = self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid)
+                target_bot = self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid, source=source)
 
             if not target_bot:
                 msg_not_found = (
