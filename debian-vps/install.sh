@@ -63,6 +63,24 @@ chmod +x /opt/ts3audiobot/TS3AudioBot
 
 echo -e "${YELLOW}[5/6] Копирование конфигураций и модулей VibeSpeak...${NC}"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+CLEANUP_REPO=false
+
+# Если скрипт запущен напрямую через curl / pipe или файлы репозитория отсутствуют:
+if [ ! -f "$SCRIPT_DIR/ym_bridge.py" ] || [ ! -d "$SCRIPT_DIR/config" ]; then
+  echo -e "${YELLOW}Скачивание актуальных модулей VibeSpeak с GitHub...${NC}"
+  TMP_REPO=$(mktemp -d /tmp/vibespeak_repo_XXXXXX)
+  if command -v git &>/dev/null; then
+    git clone --depth=1 https://github.com/Roskud/teamspeak6-music-bot.git "$TMP_REPO" --quiet 2>/dev/null || true
+  fi
+  if [ ! -f "$TMP_REPO/debian-vps/ym_bridge.py" ]; then
+    curl -fsSL https://github.com/Roskud/teamspeak6-music-bot/archive/refs/heads/main.tar.gz -o /tmp/repo.tar.gz
+    tar -xzf /tmp/repo.tar.gz -C "$TMP_REPO" --strip-components=1
+    rm -f /tmp/repo.tar.gz
+  fi
+  SCRIPT_DIR="$TMP_REPO/debian-vps"
+  CLEANUP_REPO=true
+fi
+
 mkdir -p /opt/ts3audiobot/bots/default
 cp "$SCRIPT_DIR/config/ts3audiobot.toml" /opt/ts3audiobot/ts3audiobot.toml
 cp "$SCRIPT_DIR/config/rights.toml" /opt/ts3audiobot/rights.toml
@@ -72,6 +90,35 @@ chmod +x /opt/ts3audiobot/disable_ytdl.sh
 cp "$SCRIPT_DIR/ym_bridge.py" /opt/ts3audiobot/ym_bridge.py
 cp "$SCRIPT_DIR/config/ym_logo.png" /opt/ts3audiobot/ym_logo.png
 [ -f "$SCRIPT_DIR/config/yandex_token.txt" ] && cp "$SCRIPT_DIR/config/yandex_token.txt" /opt/ts3audiobot/yandex_token.txt || true
+
+# Создание оптимизированного FFmpeg-лаунчера против заикания звука (Auto-Reconnect & Network Buffering)
+cat << 'EOF' > /opt/ts3audiobot/ffmpeg_opt.sh
+#!/usr/bin/env bash
+# VibeSpeak Optimized FFmpeg Launcher:
+# Injects network buffer and auto-reconnect options for seamless HTTP audio playback without stuttering
+FFMPEG_BIN=$(command -v ffmpeg || echo "/usr/bin/ffmpeg")
+ARGS=()
+HAS_HTTP=false
+for arg in "$@"; do
+    if [[ "$arg" =~ ^https?:// ]]; then
+        HAS_HTTP=true
+    fi
+done
+
+for arg in "$@"; do
+    if [ "$arg" = "-i" ] && [ "$HAS_HTTP" = true ]; then
+        ARGS+=("-reconnect" "1" "-reconnect_streamed" "1" "-reconnect_delay_max" "5" "-i")
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+exec "$FFMPEG_BIN" "${ARGS[@]}"
+EOF
+chmod +x /opt/ts3audiobot/ffmpeg_opt.sh
+
+# Привязка оптимизированного FFmpeg в конфигурацию TS3AudioBot
+sed -i 's|path = "ffmpeg"|path = "/opt/ts3audiobot/ffmpeg_opt.sh"|g' /opt/ts3audiobot/ts3audiobot.toml
 
 # Создание стартового скрипта start.sh
 cat << 'EOF' > /opt/ts3audiobot/start.sh
@@ -103,32 +150,58 @@ EOF
 chmod +x /opt/ts3audiobot/start.sh
 
 # ==============================================================================
-# Мастер интерактивной настройки подключения
+# Мастер интерактивной настройки подключения (поддерживает запуск через curl)
 # ==============================================================================
 echo ""
 echo -e "${CYAN}================================================================${NC}"
 echo -e "${GREEN}  ⚙️  Настройка подключения к серверу TeamSpeak                  ${NC}"
 echo -e "${CYAN}================================================================${NC}"
+
+# Определение существующих значений для быстрого обновления без сброса
+DEF_ADDR="127.0.0.1"
+DEF_VPORT="9987"
+DEF_QPORT="10011"
+DEF_QPW=""
+DEF_TOKEN=""
+
+if [ -f /opt/ts3audiobot/bridge_config.json ]; then
+  DEF_ADDR=$(grep -o '"host": "[^"]*"' /opt/ts3audiobot/bridge_config.json 2>/dev/null | cut -d'"' -f4 || echo "127.0.0.1")
+  DEF_QPORT=$(grep -o '"query_port": [0-9]*' /opt/ts3audiobot/bridge_config.json 2>/dev/null | awk '{print $2}' || echo "10011")
+  DEF_QPW=$(grep -o '"query_password": "[^"]*"' /opt/ts3audiobot/bridge_config.json 2>/dev/null | cut -d'"' -f4 || echo "")
+fi
+if [ -f /opt/ts3audiobot/yandex_token.txt ]; then
+  DEF_TOKEN=$(grep -v '^#' /opt/ts3audiobot/yandex_token.txt 2>/dev/null | tr -d '\r\n ' || true)
+fi
+
 echo -e "Если ваш TeamSpeak сервер расположен на этом же VPS — оставьте 127.0.0.1"
 echo -e "Если сервер на другом хосте — введите его внешний IP адрес или домен."
 echo ""
-read -p "Адрес TeamSpeak сервера [по умолчанию: 127.0.0.1]: " TS_ADDRESS
-TS_ADDRESS=${TS_ADDRESS:-127.0.0.1}
 
-read -p "Голосовой порт TeamSpeak [по умолчанию: 9987]: " TS_VOICE_PORT
-TS_VOICE_PORT=${TS_VOICE_PORT:-9987}
+prompt_input() {
+  local prompt_msg="$1"
+  local default_val="$2"
+  local user_val=""
+  if [ -t 0 ]; then
+    read -p "$prompt_msg" user_val
+  elif [ -e /dev/tty ]; then
+    read -p "$prompt_msg" user_val </dev/tty
+  else
+    user_val=""
+  fi
+  echo "${user_val:-$default_val}"
+}
 
-read -p "Порт ServerQuery [по умолчанию: 10011]: " TS_QUERY_PORT
-TS_QUERY_PORT=${TS_QUERY_PORT:-10011}
+TS_ADDRESS=$(prompt_input "Адрес TeamSpeak сервера [по умолчанию: $DEF_ADDR]: " "$DEF_ADDR")
+TS_VOICE_PORT=$(prompt_input "Голосовой порт TeamSpeak [по умолчанию: $DEF_VPORT]: " "$DEF_VPORT")
+TS_QUERY_PORT=$(prompt_input "Порт ServerQuery [по умолчанию: $DEF_QPORT]: " "$DEF_QPORT")
 
 echo ""
 echo -e "${YELLOW}Пароль Query-пользователя 'serveradmin':${NC}"
 echo -e "• Нужен шлюзу для приёма команд, создания временных ботов и защиты чата."
-echo -e "• Если сервер локальный, пароль выводился при первом запуске ts3server."
-read -p "Пароль serveradmin [Enter если нет пароля или стандартный]: " TS_QUERY_PASSWORD
+TS_QUERY_PASSWORD=$(prompt_input "Пароль serveradmin [Enter если без изменений]: " "$DEF_QPW")
 
 echo ""
-read -p "Токен Яндекс.Музыки (для полных треков) [Enter для пропуска]: " YM_TOKEN
+YM_TOKEN=$(prompt_input "Токен Яндекс.Музыки (для полных треков) [Enter если без изменений]: " "$DEF_TOKEN")
 
 # Запись конфигураций
 sed -i "s/address = \".*\"/address = \"$TS_ADDRESS\"/g" /opt/ts3audiobot/bots/default/bot.toml
@@ -210,3 +283,8 @@ echo -e "  Перезапуск:        ${CYAN}vibespeak restart${NC}"
 echo -e "  Смена токена:      ${CYAN}vibespeak token${NC}"
 echo -e "  Смена IP/пароля:   ${CYAN}vibespeak config${NC}"
 echo ""
+
+if [ "$CLEANUP_REPO" = true ]; then
+  rm -rf "$TMP_REPO" 2>/dev/null || true
+fi
+

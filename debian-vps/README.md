@@ -15,8 +15,15 @@
 
 ## 🚀 Установка в 1 команду
 
-Подключитесь к вашему VPS по SSH под пользователем `root` и выполните:
+Подключитесь к вашему VPS по SSH под пользователем `root` и запустите одну команду:
 
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Roskud/teamspeak6-music-bot/main/debian-vps/install.sh)"
+```
+
+*(Скрипт сам автоматически скачает актуальные файлы, установит все зависимости, настроит виртуальное окружение, защитит от заикания звука и запустит бота как системную службу).*
+
+Либо через клонирование репозитория:
 ```bash
 git clone https://github.com/Roskud/teamspeak6-music-bot.git
 cd teamspeak6-music-bot/debian-vps

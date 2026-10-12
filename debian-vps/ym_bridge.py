@@ -151,9 +151,12 @@ class StreamHandler(http.server.BaseHTTPRequestHandler):
         # Silence HTTP access logs to keep CPU and disk usage minimal
         pass
 
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
 def start_stream_server(host=STREAM_HOST, port=STREAM_PORT):
-    socketserver.TCPServer.allow_reuse_address = True
-    server = socketserver.TCPServer((host, port), StreamHandler)
+    server = ThreadedTCPServer((host, port), StreamHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     print(f"[STREAM] Local audio & avatar server active on http://{host}:{port}")

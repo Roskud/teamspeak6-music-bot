@@ -14,12 +14,16 @@ RestartSec=5
 KillMode=mixed
 Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 
+# Высокий приоритет аудио-процесса (защита от заикания звука)
+Nice=-10
+CPUSchedulingPolicy=other
+LimitNOFILE=65536
+
 # Безопасность и оптимизация ресурсов
 ProtectSystem=full
 ProtectHome=true
 NoNewPrivileges=true
-MemoryMax=512M
-CPUQuota=80%
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target
