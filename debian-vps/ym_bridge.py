@@ -167,6 +167,8 @@ def ts3_escape(s: str) -> str:
     return (s.replace('\\', r'\\')
              .replace('/', r'\/')
              .replace(' ', r'\s')
+             .replace('|', r'\p')
+             .replace('\t', r'\t')
              .replace('\n', r'\n')
              .replace('\r', ''))
 
@@ -174,8 +176,48 @@ def ts3_unescape(s: str) -> str:
     return (s.replace(r'\s', ' ')
              .replace(r'\/', '/')
              .replace(r'\p', '|')
+             .replace(r'\t', '\t')
              .replace(r'\n', '\n')
              .replace(r'\\', '\\'))
+
+def split_ts3_message(text: str, max_len: int = 800) -> list:
+    if len(text) <= max_len:
+        return [text]
+    paragraphs = text.split("\n\n")
+    chunks = []
+    current = ""
+    for p in paragraphs:
+        if current and len(current) + len(p) + 2 > max_len:
+            chunks.append(current)
+            current = p
+        else:
+            current = (current + "\n\n" + p) if current else p
+    if current:
+        chunks.append(current)
+    result = []
+    for chunk in chunks:
+        if len(chunk) <= max_len:
+            result.append(chunk)
+        else:
+            lines = chunk.split("\n")
+            cur_line = ""
+            for line in lines:
+                if cur_line and len(cur_line) + len(line) + 1 > max_len:
+                    result.append(cur_line)
+                    cur_line = line
+                else:
+                    cur_line = (cur_line + "\n" + line) if cur_line else line
+            if cur_line:
+                result.append(cur_line)
+    return result if result else [text]
+
+def normalize_cmd_key(user: str, text: str) -> str:
+    cleaned_user = ts3_unescape(user).lower().strip()
+    cleaned_text = ts3_unescape(text).lower().strip()
+    if cleaned_text.startswith('/') or cleaned_text.startswith('!'):
+        cleaned_text = '!' + cleaned_text[1:].lstrip()
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    return f"{cleaned_user}:{cleaned_text}"
 
 def find_serveradmin_password():
     env_pw = os.environ.get("TS3_SERVERADMIN_PASSWORD") or os.environ.get("SERVERADMIN_PASSWORD")
@@ -479,30 +521,41 @@ class ChanListener:
     def _loop(self):
         buf = ""
         last_ping = time.time()
-        while self.running:
-            try:
-                chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
-                if not chunk:
-                    break
-                buf += chunk
-                while '\n' in buf:
-                    line, buf = buf.split('\n', 1)
-                    line = line.strip()
-                    if 'notifytextmessage' in line:
-                        line = line[line.find('notifytextmessage'):]
-                        self.on_msg(self.cid, line)
-            except (socket.timeout, TimeoutError):
-                if time.time() - last_ping > 45:
-                    try:
-                        self.sock.sendall(b"whoami\n")
-                        last_ping = time.time()
-                    except Exception:
+        try:
+            while self.running:
+                try:
+                    chunk = self.sock.recv(4096).decode('utf-8', errors='ignore')
+                    if not chunk:
                         break
-                continue
+                    buf += chunk
+                    while '\n' in buf:
+                        line, buf = buf.split('\n', 1)
+                        line = line.strip()
+                        if 'notifytextmessage' in line:
+                            line = line[line.find('notifytextmessage'):]
+                            self.on_msg(self.cid, line)
+                except (socket.timeout, TimeoutError):
+                    if time.time() - last_ping > 45:
+                        try:
+                            self.sock.sendall(b"whoami\n")
+                            last_ping = time.time()
+                        except Exception:
+                            break
+                    continue
+                except Exception:
+                    break
+        finally:
+            self.running = False
+            try:
+                if self.sock:
+                    self.sock.close()
             except Exception:
-                break
-        if self.running and self.on_disconnect:
-            self.on_disconnect(self.cid)
+                pass
+            if self.on_disconnect:
+                try:
+                    self.on_disconnect(self.cid)
+                except Exception:
+                    pass
 
     def send_msg(self, text):
         try:
@@ -538,17 +591,30 @@ class TS3Bridge:
         }
         self.chan_listeners = {} # cid (int) -> ChanListener instance
         self.processed_cmds = {} # dedup_key -> timestamp
+        self.recent_channel_cmds = {} # norm_key -> timestamp
 
         # Primary event listener connection
         self.event_sock = None
         self.main_cid = 1
 
+    def _suppress_ts3audiobot_pm_spam(self, cldbid):
+        if not cldbid:
+            return
+        try:
+            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permskip=1")
+            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_server_textmessage_send permvalue=0 permskip=1")
+            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=i_client_private_textmessage_power permvalue=-1 permskip=1")
+        except Exception as e:
+            print(f"[PERM] Error suppressing TS3AudioBot PM spam for cldbid={cldbid}: {e}")
+
     def send_pm_msg(self, clid, text):
         if not clid:
             return
         try:
-            esc = ts3_escape(text)
-            self.cmd_client.execute(f"sendtextmessage targetmode=1 target={clid} msg={esc}")
+            chunks = split_ts3_message(text)
+            for ch in chunks:
+                esc = ts3_escape(ch)
+                self.cmd_client.execute(f"sendtextmessage targetmode=1 target={clid} msg={esc}")
         except Exception as e:
             print(f"[PM ERROR] {e}")
 
@@ -624,6 +690,7 @@ class TS3Bridge:
             return
 
         bots_to_cleanup = []
+        cldbids_to_silence = []
         with self.lock:
             matched_bot_ids = set()
 
@@ -665,10 +732,8 @@ class TS3Bridge:
 
                         # Ensure bot cannot send channel, server, or private text chat (prevent error spam)
                         if getattr(bot, '_silenced_cldbid', None) != cldbid:
-                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
-                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
-                            self.cmd_client.execute(f"clientaddperm cldbid={cldbid} permsid=i_client_private_textmessage_power permvalue=0 permnegated=1 permskip=1")
                             bot._silenced_cldbid = cldbid
+                            cldbids_to_silence.append(cldbid)
 
             # Check for missing temporary bots (kicked from server / disconnected)
             for bid, bot in list(self.bots.items()):
@@ -696,6 +761,10 @@ class TS3Bridge:
                     if bot.empty_since is not None:
                         print(f"[AUTO-LEAVE] Channel #{bot.cid} has {human_count} user(s). Countdown canceled for {bot.name}.")
                     bot.empty_since = None
+
+        # Silence bots outside lock
+        for cldbid in cldbids_to_silence:
+            self._suppress_ts3audiobot_pm_spam(cldbid)
 
         # Clean up any kicked or channel-1 bots outside lock
         for bid in bots_to_cleanup:
@@ -733,14 +802,16 @@ class TS3Bridge:
         with self.lock:
             if cid in self.chan_listeners and self.chan_listeners[cid].running:
                 return
-            listener = ChanListener(
-                host=self.host, port=self.port,
-                user=self.user, password=self.password,
-                cid=cid, on_msg=self.on_channel_listener_msg
-            )
-            if listener.start():
+        listener = ChanListener(
+            host=self.host, port=self.port,
+            user=self.user, password=self.password,
+            cid=cid, on_msg=self.on_channel_listener_msg,
+            on_disconnect=self.remove_chan_listener
+        )
+        if listener.start():
+            with self.lock:
                 self.chan_listeners[cid] = listener
-                print(f"[BRIDGE] Active listener established for Channel #{cid}")
+            print(f"[BRIDGE] Active listener established for Channel #{cid}")
 
     def remove_chan_listener(self, cid):
         with self.lock:
@@ -761,6 +832,9 @@ class TS3Bridge:
             return
 
         invoker_clid = int(invoker_clid_str) if invoker_clid_str.isdigit() else 0
+        norm_key = normalize_cmd_key(invoker, msg)
+        with self.lock:
+            self.recent_channel_cmds[norm_key] = time.time()
         self.handle_msg(msg, invoker, cid, source="channel", invoker_clid=invoker_clid)
 
     def start_log_watcher(self):
@@ -811,25 +885,50 @@ class TS3Bridge:
 
                 m = re.search(r'User\s+"?([^"\r\n]+?)"?\s+requested:\s*"?([!/][^"\r\n]+)"?', line)
                 if m:
-                    invoker = m.group(1).strip().strip('"\'')
-                    cmd_text = m.group(2).strip().strip('"\'')
+                    invoker = ts3_unescape(m.group(1).strip().strip('"\''))
+                    cmd_text = ts3_unescape(m.group(2).strip().strip('"\''))
+
+                    if any(k in invoker for k in ['VibeSpeak', 'MusicBot', 'YandexBridge', 'YB_']):
+                        continue
+
+                    # Allow channel listener / event stream 0.35s to receive and register channel commands first
+                    time.sleep(0.35)
 
                     now = time.time()
-                    dedup_key = f"{invoker}:{cmd_text}"
+                    norm_key = normalize_cmd_key(invoker, cmd_text)
                     with self.lock:
-                        last_t = self.processed_cmds.get(dedup_key, 0)
-                        if now - last_t < 1.5:
+                        cutoff = now - 60.0
+                        self.recent_channel_cmds = {k: v for k, v in self.recent_channel_cmds.items() if v > cutoff}
+                        if norm_key in self.recent_channel_cmds:
                             continue  # already handled in channel listener!
+
+                        last_t = self.processed_cmds.get(norm_key, 0)
+                        if now - last_t < 1.5:
+                            continue
 
                     print(f"[PM/LOG] Intercepted user '{invoker}': {cmd_text}")
                     clients = self.query_clients()
                     user_info = None
                     user_clid = 0
+                    invoker_clean = invoker.strip().lower()
                     for clid, info in clients.items():
-                        if info.get("nick") == invoker:
+                        if info.get("nick", "").strip().lower() == invoker_clean:
                             user_info = info
                             user_clid = clid
                             break
+
+                    if not user_clid:
+                        time.sleep(0.2)
+                        clients = self.query_clients()
+                        for clid, info in clients.items():
+                            if info.get("nick", "").strip().lower() == invoker_clean:
+                                user_info = info
+                                user_clid = clid
+                                break
+
+                    if not user_clid:
+                        print(f"[PM/LOG] Warning: Could not resolve client ID for '{invoker}'. Skipping to avoid misrouting.")
+                        continue
 
                     user_cid = user_info.get("cid", 1) if user_info else 1
                     self.handle_msg(cmd_text, invoker, user_cid, source="pm", invoker_clid=user_clid)
@@ -876,30 +975,27 @@ class TS3Bridge:
 
         s.settimeout(1.0)
         print("[TS3] Connected and listening to channel events.")
-        try:
-            self.cmd_client.execute("servergroupaddperm sgid=8 permsid=i_client_needed_private_textmessage_power permvalue=25 permnegated=0 permskip=0")
-            self.cmd_client.execute("servergroupaddperm sgid=8 permsid=i_client_private_textmessage_power permvalue=25 permnegated=0 permskip=0")
-        except Exception:
-            pass
         self.sync_channels_and_bots()
 
     def send_channel_msg(self, msg_text, cid=None):
         try:
             target_cid = cid or 1
             print(f"[MSG] Chan #{target_cid}: {msg_text}")
+            chunks = split_ts3_message(msg_text)
             with self.lock:
                 listener = self.chan_listeners.get(target_cid)
 
-            if listener and listener.running:
-                listener.send_msg(msg_text)
-                return
+            for ch in chunks:
+                if listener and listener.running:
+                    listener.send_msg(ch)
+                    continue
 
-            esc = ts3_escape(msg_text)
-            if target_cid != self.main_cid:
-                if self.cmd_client.clid:
-                    self.cmd_client.execute(f"clientmove clid={self.cmd_client.clid} cid={target_cid}")
-                    self.main_cid = target_cid
-            self.cmd_client.execute(f"sendtextmessage targetmode=2 msg={esc}")
+                esc = ts3_escape(ch)
+                if target_cid != self.main_cid:
+                    if self.cmd_client.clid:
+                        self.cmd_client.execute(f"clientmove clid={self.cmd_client.clid} cid={target_cid}")
+                        self.main_cid = target_cid
+                self.cmd_client.execute(f"sendtextmessage targetmode=2 msg={esc}")
         except Exception as e:
             print(f"[TS3] Error sending channel message: {e}")
 
@@ -1175,13 +1271,15 @@ class TS3Bridge:
         print(f"[PLAY] Direct link result: {bool(direct_link)}")
         if not direct_link:
             self.send_channel_msg(f"⚠️ Не удалось получить аудиопоток: {item['title']}", cid=bot.cid)
+            next_item = None
             with self.lock:
                 if bot.queue:
                     next_item = bot.queue.pop(0)
-                    return self.play_item(bot, next_item, notify=True)
                 else:
                     bot.current_item = None
                     self.clear_bot_avatar(bid)
+            if next_item:
+                return self.play_item(bot, next_item, notify=True)
             return False
 
         StreamHandler.current_streams[bid] = direct_link
@@ -1256,17 +1354,21 @@ class TS3Bridge:
     def disconnect_bot(self, bot_id):
         self.cleanup_bot(bot_id)
 
-    def handle_bot_add(self, user_cid, invoker_name, invoker_clid=None, source="channel"):
+    def handle_bot_add(self, user_cid, invoker_name, invoker_clid=None, source="channel", notify=True):
         def reply_msg(msg):
-            if source == "pm" and invoker_clid:
-                self.send_pm_msg(invoker_clid, msg)
+            if source == "pm":
+                if invoker_clid:
+                    self.send_pm_msg(invoker_clid, msg)
+                else:
+                    print(f"[REPLY PM ERROR] Cannot reply in PM to {invoker_name}: invoker_clid is None")
             else:
                 self.send_channel_msg(msg, cid=user_cid)
 
         with self.lock:
             for bot in self.bots.values():
                 if bot.cid == user_cid:
-                    reply_msg(f"ℹ️ В вашем канале уже находится бот {bot.name}.")
+                    if notify:
+                        reply_msg(f"ℹ️ В вашем канале уже находится бот {bot.name}.")
                     return bot
 
             temp_bots = [b for b in self.bots.values() if not b.is_main]
@@ -1323,26 +1425,26 @@ class TS3Bridge:
 
         self.cmd_client.execute(f"clientmove clid={new_clid} cid={user_cid}")
         if new_cldbid:
-            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_channel_textmessage_send permvalue=0 permnegated=1 permskip=1")
-            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=b_client_server_textmessage_send permvalue=0 permnegated=1 permskip=1")
-            self.cmd_client.execute(f"clientaddperm cldbid={new_cldbid} permsid=i_client_private_textmessage_power permvalue=0 permnegated=1 permskip=1")
+            self._suppress_ts3audiobot_pm_spam(new_cldbid)
 
         new_bot = BotInstance(bot_id=new_id, name=bot_name, is_main=False, cid=user_cid)
         new_bot.clid = new_clid
         new_bot.cldbid = new_cldbid
+        new_bot._silenced_cldbid = new_cldbid
         with self.lock:
             self.bots[new_id] = new_bot
 
         self.ensure_chan_listener(user_cid)
 
-        self.send_channel_msg(
-            f"🤖 Временный бот {bot_name} прибыл в канал!\n"
-            f"• Включите трек: !play <песня>\n"
-            f"• Бот автоматически выйдет, когда в канале никого не останется.",
-            cid=user_cid
-        )
-        if source == "pm" and invoker_clid:
-            self.send_pm_msg(invoker_clid, f"🤖 Временный бот {bot_name} прибыл в ваш канал!")
+        if notify:
+            self.send_channel_msg(
+                f"🤖 Временный бот {bot_name} прибыл в канал!\n"
+                f"• Включите трек: !play <песня>\n"
+                f"• Бот автоматически выйдет, когда в канале никого не останется.",
+                cid=user_cid
+            )
+            if source == "pm" and invoker_clid:
+                self.send_pm_msg(invoker_clid, f"🤖 Временный бот {bot_name} прибыл в ваш канал!")
         return new_bot
 
     def handle_bot_remove(self, user_cid, invoker_clid=None, source="channel"):
@@ -1354,8 +1456,9 @@ class TS3Bridge:
                     break
 
         def reply_msg(msg):
-            if source == "pm" and invoker_clid:
-                self.send_pm_msg(invoker_clid, msg)
+            if source == "pm":
+                if invoker_clid:
+                    self.send_pm_msg(invoker_clid, msg)
             else:
                 self.send_channel_msg(msg, cid=user_cid)
 
@@ -1381,8 +1484,9 @@ class TS3Bridge:
                     status = f"играет: {bot.current_item['title']}"
                 msg += f"• [{bot.name}] ({tag}) — Канал #{bot.cid} ({status})\n"
             msg += "\nЧтобы добавить бота в ваш канал: !bot add"
-        if source == "pm" and invoker_clid:
-            self.send_pm_msg(invoker_clid, msg.strip())
+        if source == "pm":
+            if invoker_clid:
+                self.send_pm_msg(invoker_clid, msg.strip())
         else:
             self.send_channel_msg(msg.strip(), cid=user_cid)
 
@@ -1422,16 +1526,21 @@ class TS3Bridge:
                         continue
 
                     print(f"[QUEUE] Bot {bot.name} (ID {bot.bot_id}) finished track: {bot.current_item.get('title')}")
+                    item_to_play = None
+                    is_loop = False
                     with self.lock:
                         if bot.is_looping and bot.current_item:
-                            self.play_item(bot, bot.current_item, notify=False, is_loop=True)
+                            item_to_play = bot.current_item
+                            is_loop = True
                         elif bot.queue:
-                            next_item = bot.queue.pop(0)
-                            self.play_item(bot, next_item, notify=True)
+                            item_to_play = bot.queue.pop(0)
+                            is_loop = False
                         else:
                             bot.current_item = None
                             self.clear_bot_avatar(bot.bot_id)
                             self.send_channel_msg("⏹️ Очередь треков завершена.", cid=bot.cid)
+                    if item_to_play:
+                        self.play_item(bot, item_to_play, notify=not is_loop, is_loop=is_loop)
             except Exception as e:
                 print(f"[LIFECYCLE ERROR] {e}")
 
@@ -1446,18 +1555,28 @@ class TS3Bridge:
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         now = time.time()
-        dedup_key = f"{invoker}:{raw}"
+        norm_key = normalize_cmd_key(invoker, raw)
         with self.lock:
-            last_t = self.processed_cmds.get(dedup_key, 0)
+            cutoff = now - 60.0
+            self.recent_channel_cmds = {k: v for k, v in self.recent_channel_cmds.items() if v > cutoff}
+            if source == "channel":
+                self.recent_channel_cmds[norm_key] = now
+
+            last_t = self.processed_cmds.get(norm_key, 0)
             if now - last_t < 1.5:
                 return
-            self.processed_cmds[dedup_key] = now
+            self.processed_cmds[norm_key] = now
+            if len(self.processed_cmds) > 200:
+                self.processed_cmds = {k: v for k, v in self.processed_cmds.items() if v > now - 30.0}
 
         print(f"[CMD] {invoker} (Chan #{invoker_cid}, src={source}): !{cmd} '{arg}'")
 
         def reply(msg):
-            if source == "pm" and invoker_clid:
-                self.send_pm_msg(invoker_clid, msg)
+            if source == "pm":
+                if invoker_clid:
+                    self.send_pm_msg(invoker_clid, msg)
+                else:
+                    print(f"[REPLY PM ERROR] Cannot reply in PM to {invoker}: invoker_clid is 0")
             else:
                 self.send_channel_msg(msg, cid=invoker_cid)
 
@@ -1502,7 +1621,7 @@ class TS3Bridge:
         if not target_bot:
             # If user wants to play music or radio, auto-summon a bot to their channel!
             if cmd in ["play", "p", "плей", "играй", "radio", "r", "радио", "lofi"]:
-                target_bot = self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid, source=source)
+                target_bot = self.handle_bot_add(invoker_cid, invoker, invoker_clid=invoker_clid, source=source, notify=False)
 
             if not target_bot:
                 msg_not_found = (
@@ -1563,6 +1682,7 @@ class TS3Bridge:
                 reply(f"❌ {err or 'Трек не найден'}")
                 return
 
+            first_item = None
             with self.lock:
                 if target_bot.current_item is not None:
                     target_bot.queue.extend(items)
@@ -1575,8 +1695,9 @@ class TS3Bridge:
                     if len(items) > 1:
                         target_bot.queue.extend(items[1:])
                         reply(f"➕ В очереди {len(items)-1} трек(ов) ({err or 'альбом/плейлист'}).")
-                    self.play_item(target_bot, first_item, notify=False)
-                    reply(f"▶ Играет Яндекс.Музыка: {first_item['title']}")
+            if first_item:
+                self.play_item(target_bot, first_item, notify=False)
+                reply(f"▶ Играет Яндекс.Музыка: {first_item['title']}")
             return
 
         # 5. QUEUE COMMAND (!queue, !q, !очередь)
@@ -1627,17 +1748,19 @@ class TS3Bridge:
 
         # 7. SKIP / NEXT COMMAND (!skip, !next, !скип)
         if cmd in ["skip", "next", "скип", "дальше"]:
+            next_item = None
             with self.lock:
                 target_bot.is_looping = False
                 if target_bot.queue:
                     next_item = target_bot.queue.pop(0)
                     reply(f"⏭️ Пропуск трека. Следующий: {next_item['title']}")
-                    self.play_item(target_bot, next_item, notify=False)
                 else:
                     reply("⏭️ Очередь пуста. Воспроизведение остановлено.")
                     self.command_bot_silent("!stop", bot_id=target_bot.bot_id)
                     target_bot.current_item = None
                     self.clear_bot_avatar(target_bot.bot_id)
+            if next_item:
+                self.play_item(target_bot, next_item, notify=False)
             return
 
         # 8. REMOVE TRACK FROM QUEUE (!remove <number>)
@@ -1829,7 +1952,11 @@ class TS3Bridge:
                     clients = self.query_clients()
                     invoker_cid = clients.get(invoker_clid, {}).get("cid", 1)
 
-                    src = "server" if targetmode == 3 else "channel"
+                    src = "pm" if targetmode == 1 else ("server" if targetmode == 3 else "channel")
+                    if src == "channel":
+                        norm_key = normalize_cmd_key(invoker, msg)
+                        with self.lock:
+                            self.recent_channel_cmds[norm_key] = time.time()
                     self.handle_msg(msg, invoker, invoker_cid, source=src, invoker_clid=invoker_clid)
             except (socket.timeout, TimeoutError):
                 if time.time() - last_ping > 60:
