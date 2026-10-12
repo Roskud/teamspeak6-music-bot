@@ -11,6 +11,7 @@ import urllib.request
 import logging
 import json
 import glob
+import random
 
 # Suppress yandex_music verbose logs
 logging.getLogger("yandex_music").setLevel(logging.CRITICAL)
@@ -289,9 +290,10 @@ COMMANDS_HELP_TEXT = (
     "🎵 КОМАНДЫ VIBESPEAK:\n\n"
     "▶ ВОСПРОИЗВЕДЕНИЕ (Яндекс.Музыка):\n"
     "• !play <название или артист> — воспроизвести трек (если уже играет — добавить в очередь)\n"
-    "• !play <ссылка на трек/альбом/плейлист> — воспроизведение по прямой ссылке\n\n"
+    "• !play <ссылка на трек/альбом/плейлист> — воспроизведение по ссылке (плейлисты играют в случайном порядке 🔀)\n\n"
     "📋 ОЧЕРЕДЬ И ЗАЦИКЛИВАНИЕ:\n"
     "• !queue (или !q) — показать текущую очередь и статус повтора\n"
+    "• !shuffle (или !шаффл) — перемешать треки в очереди в случайном порядке\n"
     "• !loop (или !repeat) — включить / выключить зацикливание текущего трека\n"
     "• !skip (или !next) — пропустить текущий трек и включить следующий из очереди\n"
     "• !remove <номер> — удалить трек из очереди (например: !remove 2)\n"
@@ -1085,8 +1087,9 @@ class TS3Bridge:
 
                     if raw_tracks:
                         items = [self._make_track_item(t) for t in raw_tracks]
+                        random.shuffle(items)
                         pl_title = pl.title or "Плейлист"
-                        return items, f"плейлист \"{pl_title}\""
+                        return items, f"плейлист \"{pl_title}\" (случайный порядок 🔀)"
                     else:
                         return None, "В плейлисте нет доступных треков или он является приватным."
                 else:
@@ -1126,8 +1129,9 @@ class TS3Bridge:
 
                     if raw_tracks:
                         items = [self._make_track_item(t) for t in raw_tracks]
+                        random.shuffle(items)
                         pl_title = pl.title or "Плейлист"
-                        return items, f"плейлист \"{pl_title}\""
+                        return items, f"плейлист \"{pl_title}\" (случайный порядок 🔀)"
             except Exception as e:
                 return None, f"Ошибка загрузки плейлиста: {e}"
 
@@ -1607,7 +1611,7 @@ class TS3Bridge:
                 else:
                     msg += "\n📋 Больше треков в очереди нет.\n"
 
-                msg += "\nУправление: !skip (пропуск) | !loop (повтор) | !clear (очистить)"
+                msg += "\nУправление: !skip (пропуск) | !shuffle (перемешать) | !loop (повтор) | !clear (очистить)"
             reply(msg.strip())
             return
 
@@ -1655,6 +1659,16 @@ class TS3Bridge:
             with self.lock:
                 target_bot.queue.clear()
                 reply("🗑️ Очередь треков очищена (текущий трек продолжит играть).")
+            return
+
+        # 10. SHUFFLE QUEUE (!shuffle, !шаффл, !перемешать, !random)
+        if cmd in ["shuffle", "шаффл", "перемешать", "рандом", "random", "mix", "микс"]:
+            with self.lock:
+                if len(target_bot.queue) < 2:
+                    reply("В очереди должно быть хотя бы 2 трека для перемешивания. Добавьте треки: !play <плейлист>")
+                else:
+                    random.shuffle(target_bot.queue)
+                    reply(f"🔀 Очередь перемешана в случайном порядке! Следующий трек: {target_bot.queue[0]['title']} (всего в очереди: {len(target_bot.queue)})")
             return
 
         # 10. STOP COMMAND
